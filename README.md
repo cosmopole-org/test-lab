@@ -1,76 +1,40 @@
 # Decillion stack end-to-end exercise
 
-This branch records the fixes I made while bringing a single-node
-Caspar + Decillion deployment up and exercising it through the
-Decillion CLI.
+This branch is a single working tree of three upstream repos plus the
+fixes I made while bringing them up as a single-node deployment and
+exercising them through the Decillion CLI.
 
-The fixes themselves belong to three upstream repos. I made them on
-local branches called `claude/inspect-three-repos-oowqi` in each repo,
-but the environment's git proxy only authorizes
-`cosmopole-org/test-lab` for pushes — so the changes live here as
-bundles and `.patch` files instead.
+## Layout
 
-## Repos
+- `caspar/` — protocol node (Go) + appengine (Rust) + `cmd/casparctl`
+  + `sdk/`. Upstream: `cosmopole-org/caspar`, branched from `Main`.
+- `decillionai-server/` — namespace + endpoint WASM creatures (Go,
+  built with TinyGo). Upstream: `DecillionAI/decillionai-server`,
+  branched from `main`.
+- `decillionai-cli/` — TypeScript client. Upstream:
+  `DecillionAI/decillionai-cli`, branched from `main`.
+- `full-deploy-and-test.sh` — end-to-end script that logs in, creates
+  a machine creature + program per namespace, deploys each wasm, then
+  runs `stores.create` and `stores.list`.
 
-- `cosmopole-org/caspar` — the protocol node
-- `DecillionAI/decillionai-server` — namespace + endpoint WASM creatures
-- `DecillionAI/decillionai-cli` — TypeScript client
+## What works
 
-## Applying the patches
+A fresh clone of each upstream repo would not even build the appengine
+crate, and even after building, every WASM creature would receive an
+empty `path`/`payload` from the framework and short-circuit. After the
+fixes in this branch the full happy path runs:
 
-Each branch was cut from the repo's current upstream (`origin/Main` for
-caspar, `origin/main` for the others). Two equivalent formats are
-shipped per repo:
+1. `caspar` boots as a single node (chain + WS/TCP/federation listeners).
+2. All five decillion namespace creatures (chain, invites, pc, storage,
+   stores) build to WASM via TinyGo.
+3. A user logs in via the CLI and gets a real id (`1@global`).
+4. A space (Store) is created via `stores.create`.
+5. Each namespace lives under its own machine creature + program, with
+   the WASM artifact deployed.
+6. Signalling the program runs the WASM and persists state.
+7. Follow-up signals (e.g. `stores.list`) see the persisted state.
 
-```bash
-# Option A: fetch the branch from the bundle
-cd path/to/caspar
-git fetch ../patches/caspar.bundle claude/inspect-three-repos-oowqi
-git checkout -b claude/inspect-three-repos-oowqi FETCH_HEAD
-
-# Option B: apply the patch file with metadata preserved
-cd path/to/caspar
-git am path/to/patches/caspar/0001-*.patch
-```
-
-Same shape for `decillionai-server` and `decillionai-cli`.
-
-## What the fixes do, end to end
-
-The goal was to take the three repos from a fresh clone to a working
-local stack where:
-
-1. caspar boots as a single node
-2. all five decillion namespace creatures (chain, invites, pc, storage,
-   stores) build to WASM via TinyGo
-3. a user logs in via the CLI and gets a real id
-4. a space (Store) is created via `stores.create`
-5. each namespace lives under its own machine creature + program, with
-   the WASM artifact deployed
-6. signalling the program runs the WASM and persists state
-7. follow-up signals (e.g. `stores.list`) see the persisted state
-
-All seven steps work. The smoke run looks like this:
-
-```
-==> 1. login
-1@global
-
-==> 2.stores create machine creature
-  creature=3@global
-==> 3.stores create program under it
-  program=5@global
-==> 4.stores deploy wasm
-  deployed
-... (chain/invites/pc/storage analogous) ...
-
---- stores.create ---
-[Object: null prototype] { passed: true }
---- stores.list ---
-[Object: null prototype] { passed: true }
-```
-
-In the kasper log the wasm output is captured as a `vmOutput` event:
+In the kasper log the wasm's response is captured as a `vmOutput` event:
 
 ```json
 {"key":"vmOutput","requestId":3,"input":{
@@ -80,7 +44,7 @@ In the kasper log the wasm output is captured as a `vmOutput` event:
 }}
 ```
 
-and `stores.list` then returns
+and `stores.list` then returns:
 
 ```json
 {"action":"list","host":{"ok":true,"stores":[{
@@ -90,81 +54,90 @@ and `stores.list` then returns
 ```
 
 so the Store is genuinely persisted in caspar's badger DB and reachable
-through the WASM creature.
+through the WASM creature on read-back.
 
 ## Summary of the fixes
 
-### caspar (`patches/caspar/`)
+### `caspar/`
 
-- **appengine**
-  - pin `bollard` to 0.18.1, add `tokio` directly (the existing call
-    sites in `docker_vm_controller` use the 0.18 API)
-  - `bootstrap/engine`: send the zmq response as bytes (Send needs a
-    `Sendable`, not a String)
-  - `bootstrap/restore`: export `restore_previously_running_vms`
-  - `models/vm_runtime`: after `commit_as_offchain`, re-emit any text
-    the creature pushed via the `output` host op as a `vmOutput` log
-    so the host can observe what the program produced
-- **chain**
-  - defer `restoreChainsFromStorage` to a public hook the Core calls
-    after `c.tools` is wired up — the original code dereferenced nil
-    `c.tools` in `NewChain` -> `restoreChainsFromStorage` ->
-    `app.ModifyState`
-- **signaler**
-  - `SignalUser`: deliver directly when a VM listener is registered
-    locally for the target id. Program ids look like `5@global` (have
-    a `@`) so the old code fell through the user-lookup branch and
-    bailed because no `User` row exists for a program
-- **vmm**
-  - `handleStoreCrud`: real Create/Update/Delete/Get/List on the
-    collaboration `Store` model (`obj::Store::*`, `hasaccess::*`,
-    `creatorof::*`, `StoreMeta::*`)
-  - route `createStore`/`updateStore`/`deleteStore`/`getStore`/
-    `listStores` ops to it; alias `output` and `vmOutput` to the
-    vm-log handler so creature output is captured
-- **actions/creature**
+- **appengine** (`caspar/node/appengine/`)
+  - `Cargo.toml`: pin `bollard = 0.18.1` (matches the call sites in
+    `docker_vm_controller`); add `tokio` as a direct dependency
+  - `src/bootstrap/engine.rs`: send the zmq response as bytes (Send
+    needs a `Sendable`, not a `String`)
+  - `src/bootstrap/restore.rs`: export `restore_previously_running_vms`
+    so `mod.rs` can re-export it
+  - `src/models/vm_runtime.rs`: after `commit_as_offchain`, re-emit any
+    text the creature pushed via the `output` host op as a `vmOutput`
+    log so the host platform can observe what the program produced
+- **chain** (`caspar/node/src/drivers/network/chain/chain.go`)
+  - defer `restoreChainsFromStorage` to a new `RestoreFromStorage()`
+    hook that `Core.Load` calls after `c.tools` is wired up. Before
+    this fix, `NewChain` -> `restoreChainsFromStorage` ->
+    `app.ModifyState` ran during driver construction and dereferenced
+    nil `c.tools`.
+- **signaler** (`caspar/node/src/drivers/signaler/signaler.go`)
+  - `SignalUser` now delivers directly when a VM listener is registered
+    locally for the target id. Program ids look like `5@global` (contain
+    a `@`) so the old code took the user-lookup branch and bailed
+    because no `User` row exists for a program; the VM listener
+    registered by `Vmm.Assign(programId)` was never reached.
+- **vmm** (`caspar/node/src/drivers/vmm/`)
+  - `hostcall_entities.go`: implement `handleStoreCrud` for the
+    collaboration `Store` model — real Create/Update/Delete/Get/List on
+    `obj::Store::*`, `hasaccess::*`, `creatorof::*`, `StoreMeta::*`.
+  - `hostcall_global.go`: route
+    `createStore`/`updateStore`/`deleteStore`/`getStore`/`listStores`
+    to the new handler; alias `output` and `vmOutput` to the vm-log
+    handler so creature output is captured.
+- **actions/creature** (`caspar/node/src/shell/api/actions/creature/creature.go`)
   - dev-mode Firebase bypass when `FIREBASE_SERVICE_ACCOUNT` (or
     `/app/serviceAccounts.json`) is missing — treat the `emailToken`
-    as the email so local nodes work without provisioning Firebase
-  - mirror new Creatures to the `User` and `Machine` tables so older
-    code paths (security, signaler, /programs/*) can find them
+    as the email so local nodes work without provisioning Firebase Auth.
+  - mirror newly created Creatures to the `User` and `Machine` tables
+    so older code paths (security, signaler, `/programs/*`) can find
+    them by id.
   - fix the `outputs_users.GetOutput` type assertion in `Authenticate`
-    (the underlying `Get` action returns a `map[string]any`)
+    (the underlying `/creatures/get` action returns
+    `map[string]any{"creature": Creature}`, not `GetOutput`).
   - call `/creatures/create` synchronously from `Login` (going through
-    `SecurelyAct` would resubmit on the chain and deadlock the
-    pipeline)
-- **actions/program**
+    `SecurelyAct` would resubmit on the chain and deadlock the chain
+    pipeline, which is single-threaded).
+- **actions/program** (`caspar/node/src/shell/api/actions/program/program.go`)
   - rename action-path doc comments so secured actions register under
     `/programs/*` (was `/machines/*` in several spots that the CLI
-    could not reach); fix `ListPrograms` / `ListMachines` doc names
-    that didn't match their function names (so the actions had no
-    registered key at all)
-  - on wasm deploy, save the bytecode as `module.wasm` (was `build.sh`)
-    and persist `vmEntityPath`/`vmEntityType` so
+    could not reach); fix the `ListPrograms`/`ListMachines` doc names
+    that didn't match their function names (so those actions had no
+    registered key at all — the doc-extractor couldn't find them).
+  - on wasm deploy, save the bytecode as `module.wasm` (was
+    `build.sh`) and persist `vmEntityPath`/`vmEntityType` links so
     `resolveVmExecutionTarget` can locate the artifact; only run
-    `BuildVmImage` for docker (wasm needs no build step)
-- **core**
+    `BuildVmImage` for docker (wasm needs no build step).
+- **core** (`caspar/node/src/core/module/core/core.go`)
   - lock `chainCallbacks`/`messageCallbacks` access (concurrent map
-    writes were crashing the node under load)
-  - fire the stored chain callback when this node was the *Submitter*
+    writes were crashing the node under load — `fatal error:
+    concurrent map writes`).
+  - fire the stored chain callback when this node was the `Submitter`
     (the old code compared against `packet.Author`, which is
-    `user::<id>` and never matches `c.id`)
+    `user::<id>` and never matches `c.id`).
+- **abstract** (`caspar/node/src/abstract/adapters/network/chain.go`)
+  - add `RestoreFromStorage()` to `IChain` for the new deferred restore.
 
-### decillionai-server (`patches/decillionai-server/`)
+### `decillionai-server/`
 
-- `unwrapSignal()` in every namespace creature (chain, invites, pc,
-  storage, stores) — the host's runVm input is a wrapped
-  `{user, store, action, data, entityId}` envelope with the
-  user-supplied `{action, payload}` buried one or two JSON layers
-  deep. Without this, `p.Path`/`p.Payload` were always empty and the
-  per-action dispatch never fired.
-- `stores` creature: dispatch `create`/`update`/`delete`/`get`/`list`
-  to the matching host ops so `signalMiniapp("stores", "create", ...)`
-  actually persists a Store.
+- `unwrapSignal()` added to every namespace creature
+  (`creatures/{chain,invites,pc,storage,stores}/main.go`) — the host's
+  runVm input is a wrapped `{user, store, action, data, entityId}`
+  envelope with the user-supplied `{action, payload}` buried one or two
+  JSON layers deep. Without this, `p.Path`/`p.Payload` were always
+  empty and the per-action dispatch never fired.
+- The `stores` creature dispatches `create`/`update`/`delete`/`get`/`list`
+  to the matching host ops, so `signalMiniapp("stores", "create", ...)`
+  actually persists a `Store`.
 - `build-all.sh`: one-shot TinyGo build of every namespace + endpoint
   creature into `wasm/<ns>.wasm`.
 
-### decillionai-cli (`patches/decillionai-cli/`)
+### `decillionai-cli/`
 
 - env-driven host/port/protocol (`DECILLION_HOST`, `DECILLION_PORT`,
   `DECILLION_PROTO`) so the CLI can target any node, not just
@@ -172,41 +145,67 @@ through the WASM creature.
 - `DECILLION_INSECURE=1` drops strict cert checks on tcp + ws — needed
   for local nodes with self-signed certs.
 - `loginDev <username> [email]`: skips the Auth0 browser round trip
-  and submits the raw email as the emailToken. Pairs with the caspar
+  and submits the raw email as the `emailToken`. Pairs with the caspar
   dev-mode Firebase bypass above.
 - `programs.deploy` sends the canonical
   `{machineId, entityId, entityType, payload, downloadable, metadata}`
-  the server expects (was sending the legacy
+  shape the server's `DeployInput` expects (was sending the legacy
   `{machineId, byteCode, runtime, metadata}` shape and failing
   validation).
 - `creatures.signal` forwards `programId` and `entityId` at the top
   level so the server's `Signal` action can route the packet to the
-  program's VM listener.
+  program's VM listener (not just the parent creature).
 - `help`/`clear` short-circuit before opening the socket so they work
   offline.
-- Add `ws` (and `@types/ws`) to deps — index.ts was importing them but
-  the package was missing.
+- Add `ws` (and `@types/ws`) to dependencies — `index.ts` was importing
+  them but the package was missing from `package.json`.
 
 ## Repro
 
+Prerequisites: `tinygo >= 0.35` (we used 0.39), WasmEdge 0.14,
+`librocksdb-dev`, `libzmq3-dev`, `libsnappy-dev`, `libgflags-dev`,
+`libnuma-dev`, `default-jre-headless` (>=17), `go 1.24`, `rust stable`,
+QuestDB.
+
 ```bash
-# 1) clone & apply the patches (above)
-# 2) install deps: tinygo>=0.35, wasmedge 0.14, librocksdb-dev, libzmq3-dev,
-#    libsnappy-dev, libgflags-dev, libnuma-dev, java>=17, go 1.24, rust stable
-# 3) provision a single-node config:
-#    - keys: cd caspar/node/keygen && go run . (writes ~/.babble/{priv_key,key.pub})
-#    - peers: echo '[{"NetAddr":"127.0.0.1:8079","PubKeyHex":"<key.pub>","Moniker":"head"}]'
-#      > ~/.babble/peers.genesis.json && cp ~/.babble/peers.genesis.json ~/.babble/peers.json
-#    - certs: openssl self-sign to /app/certs/{fullchain,privkey}.pem
-#    - questdb running on :8812 (PG wire)
-#    - copy node/scripts/* to /app/scripts/
-# 4) build:
-#    - appengine:  cd caspar/node/appengine && cargo build
-#    - kasper:     cd caspar/node && CGO_ENABLED=1 go build -o /usr/local/bin/kasper .
-#    - creatures:  cd decillionai-server && ./build-all.sh
-#    - cli:        cd decillionai-cli && npm install && npm run build && npm install -g .
-# 5) run:
-#    - /home/user/caspar/node/appengine/target/debug/appengine &
-#    - FIREBASE_SERVICE_ACCOUNT=/nonexistent /usr/local/bin/kasper &
-# 6) exercise (see patches/full-deploy-and-test.sh for the canonical run)
+# 1) Provision a single-node config
+#    keys
+cd caspar/node/keygen && go run .         # writes ~/.babble/{priv_key,key.pub}
+PUB=$(cat ~/.babble/key.pub)
+cat > ~/.babble/peers.genesis.json <<EOF
+[{"NetAddr":"127.0.0.1:8079","PubKeyHex":"$PUB","Moniker":"head"}]
+EOF
+cp ~/.babble/peers.genesis.json ~/.babble/peers.json
+
+#    certs (self-signed)
+mkdir -p /app/certs && openssl req -x509 -newkey rsa:2048 \
+  -keyout /app/certs/privkey.pem -out /app/certs/fullchain.pem \
+  -sha256 -days 3650 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName = DNS:localhost,IP:127.0.0.1"
+
+#    QuestDB (PG wire on :8812)
+bash caspar/node/scripts/install-questdb.sh
+/app/questdb/questdb.sh start -d /app/questdb
+
+#    runtime scripts caspar expects under /app
+mkdir -p /app/scripts && cp caspar/node/scripts/*.sh /app/scripts/
+
+# 2) Build
+cd caspar/node/appengine && cargo build
+cd ../ && CGO_ENABLED=1 go build -o /usr/local/bin/kasper .
+cd ../../decillionai-server && ./build-all.sh
+cd ../decillionai-cli && npm install && npm run build && npm install -g .
+
+# 3) Write the .env for caspar (sample.env documents all keys)
+#    set OWNER_ID, OWNER_PRIVATE_KEY (PKCS8 PEM, escaped \n), the API
+#    ports (8076 ws / 8077 tcp / 8078 fed / 8079 chain / 9099 telemetry),
+#    STORAGE_ROOT_PATH=/app/storage, BASE_DB_PATH=/app/db etc., and
+#    IS_HEAD=true.
+
+# 4) Run
+cd caspar/node/appengine && ./target/debug/appengine &
+cd caspar/node && FIREBASE_SERVICE_ACCOUNT=/nonexistent /usr/local/bin/kasper &
+
+# 5) Exercise
+bash full-deploy-and-test.sh
 ```

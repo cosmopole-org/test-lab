@@ -1,0 +1,15 @@
+# Build outputs and caches across all subprojects
+caspar/node/appengine/target/
+caspar/node/appengine/appletdb/
+caspar/node/build/
+decillionai-cli/node_modules/
+decillionai-cli/dist/
+decillionai-server/wasm/
+
+# Local state from manual testing
+auth/
+files/
+
+# Editor / OS noise
+.DS_Store
+*.swp

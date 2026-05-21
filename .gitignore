@@ -6,9 +6,10 @@ decillionai-cli/node_modules/
 decillionai-cli/dist/
 decillionai-server/wasm/
 
-# Local state from manual testing
-auth/
-files/
+# Local state from manual CLI testing (workdir's `auth/` and `files/`
+# live under the user's working directory at runtime, not in the repo)
+/auth/
+/files/
 
 # Editor / OS noise
 .DS_Store

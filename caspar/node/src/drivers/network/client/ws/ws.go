@@ -136,7 +136,6 @@ func (t *Ws) Listen(port int, tlsConfig *tls.Config) {
 }
 
 func (t *Socket) writeUpdate(key string, updatePack any, writeRaw bool) {
-
 	keyBytes := []byte(key)
 	keyBytesLen := make([]byte, 4)
 	binary.BigEndian.PutUint32(keyBytesLen, uint32(len(keyBytes)))
@@ -367,7 +366,47 @@ func (t *Socket) processPacket(packet []byte) {
 		}
 		t.writeResponse(packetId, httpStatusCode, packetmodel.BuildErrorJson(err.Error()), false)
 	}
+	// /creatures/authenticate is the canonical auth packet most clients (the
+	// decillion CLI included) use to attach a session to this socket. Register
+	// a signaler.Listener for the user so back-channel signals (creature
+	// responses, store/group broadcasts, etc.) get pushed down this WS.
+	if err == nil && path == "/creatures/authenticate" && userId != "" && t.userId != userId {
+		t.attachUserListener(userId)
+	}
 	t.writeResponse(packetId, 0, result, false)
+}
+
+// attachUserListener wires this socket up as the live destination for any
+// SignalUser(userId, ...) calls that target the authenticated user. It is
+// idempotent: re-running it on the same socket simply re-registers the
+// listener under the user id.
+func (t *Socket) attachUserListener(userId string) {
+	lis := &signaler.Listener{
+		Id:     userId,
+		Paused: false,
+		Signal: func(key string, b any) {
+			if b != nil {
+				t.writeUpdate(key, b, true)
+			}
+		},
+	}
+	t.Lock.Lock()
+	t.userId = userId
+	t.Lock.Unlock()
+	t.server.sockets.Set(userId, t)
+	t.app.Tools().Signaler().ListenToSingle(lis)
+	var storeIds []string
+	prefix := "hasaccess::" + userId + "::"
+	t.app.ModifyState(true, func(trx trx.ITrx) error {
+		pIds, e := trx.GetLinksList(prefix, -1, -1)
+		if e == nil {
+			storeIds = pIds
+		}
+		return nil
+	})
+	for _, storeId := range storeIds {
+		t.app.Tools().Signaler().JoinGroup(storeId[len(prefix):], userId)
+	}
 }
 
 func NewWs(app core.ICore) *Ws {

@@ -67,9 +67,14 @@ func (p *Signaler) signalListener(key string, listenerId string, data any, pack 
 		return
 	}
 	if pack {
-		var message string
+		var message []byte
 		switch d := data.(type) {
 		case string:
+			message = []byte(d)
+		case []byte:
+			// Already serialised by the caller — passing it through
+			// json.Marshal would base64-encode it, which would corrupt JSON
+			// payloads (creature signal responses, etc.).
 			message = d
 		default:
 			msg, err := json.Marshal(d)
@@ -77,9 +82,9 @@ func (p *Signaler) signalListener(key string, listenerId string, data any, pack 
 				log.Println(err)
 				return
 			}
-			message = string(msg)
+			message = msg
 		}
-		listener.Signal(key, []byte(message))
+		listener.Signal(key, message)
 	} else {
 		listener.Signal(key, data)
 	}

@@ -10,10 +10,12 @@ import (
 func hostCall(offset uint32, length uint32) uint64
 
 type packet struct {
-	Path       string         `json:"path"`
-	Payload    map[string]any `json:"payload"`
-	CreatureID string         `json:"creatureId,omitempty"`
-	StoreID    string         `json:"storeId,omitempty"`
+	Path          string         `json:"path"`
+	Payload       map[string]any `json:"payload"`
+	CreatureID    string         `json:"creatureId,omitempty"`
+	StoreID       string         `json:"storeId,omitempty"`
+	RequesterID   string         `json:"requesterId,omitempty"`
+	CorrelationID string         `json:"correlationId,omitempty"`
 }
 
 func bytesAt(offset uint32, length uint32) []byte {
@@ -135,6 +137,7 @@ func unwrapSignal(input string) packet {
 	if user, ok := raw["user"].(map[string]any); ok {
 		if id, ok := user["id"].(string); ok {
 			p.CreatureID = id
+			p.RequesterID = id
 		}
 	}
 	dataStr, _ := raw["data"].(string)
@@ -144,6 +147,9 @@ func unwrapSignal(input string) packet {
 	var layer1 map[string]any
 	if err := json.Unmarshal([]byte(dataStr), &layer1); err != nil {
 		return p
+	}
+	if cid, ok := layer1["correlationId"].(string); ok {
+		p.CorrelationID = cid
 	}
 	payloadStr, _ := layer1["payload"].(string)
 	if payloadStr == "" {
@@ -156,10 +162,36 @@ func unwrapSignal(input string) packet {
 	if action, ok := inner["action"].(string); ok {
 		p.Path = action
 	}
+	if p.CorrelationID == "" {
+		if cid, ok := inner["correlationId"].(string); ok {
+			p.CorrelationID = cid
+		}
+	}
 	if payloadField, ok := inner["payload"].(map[string]any); ok {
 		p.Payload = payloadField
 	}
 	return p
+}
+
+// signalResult delivers the creature's response back to the requester user
+// over the host's signaling channel.
+func signalResult(p packet, resp map[string]any) {
+	if p.RequesterID == "" {
+		return
+	}
+	if p.CorrelationID != "" {
+		resp["correlationId"] = p.CorrelationID
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	hostReq("signalUser", map[string]any{
+		"key":    "creatures/signal/result",
+		"userId": p.RequesterID,
+		"packet": string(body),
+		"system": true,
+	})
 }
 
 func process(input string) string {
@@ -169,8 +201,9 @@ func process(input string) string {
 	if p.Path != "" {
 		hostReq("dbOp", map[string]any{"op": "put", "key": "creatureNamespace::invites::lastPath", "val": p.Path})
 	}
-	out, _ := json.Marshal(map[string]any{"ok": true, "namespace": "invites"})
-	hostReq("output", map[string]any{"text": string(out)})
+	resp := map[string]any{"ok": true, "namespace": "invites", "action": p.Path}
+	signalResult(p, resp)
+	out, _ := json.Marshal(resp)
 	return string(out)
 }
 

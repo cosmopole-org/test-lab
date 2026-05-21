@@ -10,10 +10,12 @@ import (
 func hostCall(offset uint32, length uint32) uint64
 
 type packet struct {
-	Path       string         `json:"path"`
-	Payload    map[string]any `json:"payload"`
-	CreatureID string         `json:"creatureId,omitempty"`
-	SpaceID    string         `json:"spaceId,omitempty"`
+	Path          string         `json:"path"`
+	Payload       map[string]any `json:"payload"`
+	CreatureID    string         `json:"creatureId,omitempty"`
+	SpaceID       string         `json:"spaceId,omitempty"`
+	RequesterID   string         `json:"requesterId,omitempty"`
+	CorrelationID string         `json:"correlationId,omitempty"`
 }
 
 func bytesAt(offset uint32, length uint32) []byte {
@@ -142,7 +144,10 @@ func unwrapSignal(input string) packet {
 	}
 	if user, ok := raw["user"].(map[string]any); ok {
 		if id, ok := user["id"].(string); ok {
+			// The framework calls this "user" — for our purposes the user is
+			// also the requester whose CLI sent the signal.
 			p.CreatureID = id
+			p.RequesterID = id
 		}
 	}
 	if store, ok := raw["store"].(map[string]any); ok {
@@ -150,7 +155,8 @@ func unwrapSignal(input string) packet {
 			p.SpaceID = id
 		}
 	}
-	// `data` is a JSON string holding { programId, entity, payload: "<json>" }.
+	// `data` is a JSON string holding
+	//   { programId, entity, correlationId?, payload: "<json>" }.
 	dataStr, _ := raw["data"].(string)
 	if dataStr == "" {
 		return p
@@ -158,6 +164,9 @@ func unwrapSignal(input string) packet {
 	var layer1 map[string]any
 	if err := json.Unmarshal([]byte(dataStr), &layer1); err != nil {
 		return p
+	}
+	if cid, ok := layer1["correlationId"].(string); ok {
+		p.CorrelationID = cid
 	}
 	payloadStr, _ := layer1["payload"].(string)
 	if payloadStr == "" {
@@ -170,10 +179,38 @@ func unwrapSignal(input string) packet {
 	if action, ok := inner["action"].(string); ok {
 		p.Path = action
 	}
+	// correlationId may also live one layer deeper (depending on CLI version).
+	if p.CorrelationID == "" {
+		if cid, ok := inner["correlationId"].(string); ok {
+			p.CorrelationID = cid
+		}
+	}
 	if payloadField, ok := inner["payload"].(map[string]any); ok {
 		p.Payload = payloadField
 	}
 	return p
+}
+
+// signalResult delivers the creature's response back to the requester user
+// over the host's signaling channel. The CLI's WS listener picks up packets
+// with this key and matches them by correlationId.
+func signalResult(p packet, resp map[string]any) {
+	if p.RequesterID == "" {
+		return
+	}
+	if p.CorrelationID != "" {
+		resp["correlationId"] = p.CorrelationID
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	hostReq("signalUser", map[string]any{
+		"key":    "creatures/signal/result",
+		"userId": p.RequesterID,
+		"packet": string(body),
+		"system": true,
+	})
 }
 
 func process(input string) string {
@@ -240,16 +277,14 @@ func process(input string) string {
 		resp["host"] = hostResp
 	}
 
-	// Emit a sanity ping first to confirm execution reaches end-of-process even
-	// if json.Marshal trips over a map[string]any from the host response under
-	// TinyGo's reflect.
-	hostReq("output", map[string]any{"text": "spaces.dispatch.done:" + p.Path})
+	// Deliver the response back to the requester over the signaling channel.
+	// The CLI's signalMiniapp listens for "creatures/signal/result" packets
+	// and matches them by correlationId for its async req/res scheme.
+	signalResult(p, resp)
 	out, err := json.Marshal(resp)
 	if err != nil {
-		hostReq("output", map[string]any{"text": "marshal_error:" + err.Error()})
 		return ""
 	}
-	hostReq("output", map[string]any{"text": string(out)})
 	return string(out)
 }
 

@@ -3,10 +3,11 @@
 #   - login (dev mode)
 #   - one machine creature per namespace
 #   - one program per machine, with the corresponding wasm deployed
-#   - signal each program and capture its output
-
+#   - signal each program and capture its response via the new async
+#     creature-signal/result reply channel
 set -e
 cd "$(dirname "$0")"
+ROOT="$(pwd)"
 export DECILLION_HOST=127.0.0.1
 export DECILLION_PORT=8076
 export DECILLION_PROTO=ws
@@ -22,26 +23,20 @@ EMAIL="${DECILLION_EMAIL:-claude@dev.local}"
 
 echo "==> 1. login"
 decillion --batch "loginDev $USERNAME $EMAIL" >/dev/null
-cat auth/userId.txt
-echo
+echo "  userId=$(cat auth/userId.txt)"
 
-# Map: namespace -> wasm artifact path
 declare -A WASMS=(
-  [stores]=/home/user/decillionai-server/wasm/stores.wasm
-  [invites]=/home/user/decillionai-server/wasm/invites.wasm
-  [storage]=/home/user/decillionai-server/wasm/storage.wasm
-  [chain]=/home/user/decillionai-server/wasm/chain.wasm
-  [pc]=/home/user/decillionai-server/wasm/pc.wasm
+  [stores]=$ROOT/decillionai-server/wasm/stores.wasm
+  [invites]=$ROOT/decillionai-server/wasm/invites.wasm
+  [storage]=$ROOT/decillionai-server/wasm/storage.wasm
+  [chain]=$ROOT/decillionai-server/wasm/chain.wasm
+  [pc]=$ROOT/decillionai-server/wasm/pc.wasm
 )
 declare -A NS_TO_KEY=( [stores]=STORES [invites]=INVITES [storage]=STORAGE [chain]=CHAINS [pc]=PC )
-
 declare -A CREATURE_ID
 declare -A PROGRAM_ID
 
-extract_id() {
-  # Pulls "X@global" out of the last JS object decillion prints.
-  grep -oE "id: '[0-9]+@global'" | head -1 | sed -E "s/^id: '([^']+)'$/\1/"
-}
+extract_id() { grep -oE "id: '[0-9]+@global'" | head -1 | sed -E "s/^id: '([^']+)'$/\1/"; }
 
 for ns in "${!WASMS[@]}"; do
   wasm="${WASMS[$ns]}"
@@ -52,15 +47,15 @@ for ns in "${!WASMS[@]}"; do
 cp $wasm "\$(dirname "\$0")/bytecode"
 EOF
   chmod +x "$pkg/builder/build.sh"
-  cp /home/user/decillionai-server/creatures/$ns/main.go "$pkg/src/"
-  cp /home/user/decillionai-server/creatures/$ns/go.mod "$pkg/src/"
+  cp "$ROOT/decillionai-server/creatures/$ns/main.go" "$pkg/src/"
+  cp "$ROOT/decillionai-server/creatures/$ns/go.mod" "$pkg/src/"
 
   echo "==> 2.$ns create machine creature"
   out=$(decillion --batch "creatures.createMachine main ${ns}-app ${ns}-app ${ns}-namespace" 2>&1)
   CREATURE_ID[$ns]=$(echo "$out" | extract_id)
   echo "  creature=${CREATURE_ID[$ns]}"
 
-  echo "==> 3.$ns create program under it"
+  echo "==> 3.$ns create program"
   out=$(decillion --batch "programs.create ${ns}-prog ${CREATURE_ID[$ns]} /$ns wasm ${ns}-program" 2>&1)
   PROGRAM_ID[$ns]=$(echo "$out" | extract_id)
   echo "  program=${PROGRAM_ID[$ns]}"
@@ -70,9 +65,6 @@ EOF
   echo "  deployed"
 done
 
-# Print env vars needed for the signaling round
-echo
-echo "==> 5. exercise each namespace creature via creatures.signal"
 for ns in "${!WASMS[@]}"; do
   key="${NS_TO_KEY[$ns]}"
   export DECILLION_${key}_CREATURE_ID="${CREATURE_ID[$ns]}"
@@ -80,19 +72,20 @@ for ns in "${!WASMS[@]}"; do
   export DECILLION_${key}_ENTITY="main"
 done
 
-set +e
+echo
+echo "==> 5. exercise stores via creatures.signal (async req/res)"
 echo
 echo "--- stores.create ---"
-decillion --batch "stores.create true true global my-first-space" 2>&1 | tail -3
+decillion --batch "stores.create true true global my-first-space" 2>&1 | tail -10
 echo
 echo "--- stores.list ---"
-decillion --batch "stores.list 0 10" 2>&1 | tail -3
+decillion --batch "stores.list 0 10" 2>&1 | tail -15
 
 echo
-echo "--- exporting env for follow-up tests ---"
-for ns in "${!WASMS[@]}"; do
-  key="${NS_TO_KEY[$ns]}"
-  echo "export DECILLION_${key}_CREATURE_ID=${CREATURE_ID[$ns]} DECILLION_${key}_PROGRAM_ID=${PROGRAM_ID[$ns]} DECILLION_${key}_ENTITY=main"
-done > /tmp/decillion-deploy-env.sh
+{ for ns in "${!WASMS[@]}"; do
+    key="${NS_TO_KEY[$ns]}"
+    echo "export DECILLION_${key}_CREATURE_ID=${CREATURE_ID[$ns]} DECILLION_${key}_PROGRAM_ID=${PROGRAM_ID[$ns]} DECILLION_${key}_ENTITY=main"
+  done
+} > /tmp/decillion-deploy-env.sh
 chmod +x /tmp/decillion-deploy-env.sh
-cat /tmp/decillion-deploy-env.sh
+echo "env exports written to /tmp/decillion-deploy-env.sh"
